@@ -25,8 +25,6 @@ use Test2::Util::HashBase qw{
     _no_numbers
     _no_diag
 
-    <stream_id
-
     <tb <tb_handles
 
     <pid <tid
@@ -94,8 +92,6 @@ sub fh {
 sub init {
     my $self = shift;
 
-    $self->{+STREAM_ID} = 1;
-
     $self->{+PID} = $$;
     $self->{+TID} = get_tid();
 
@@ -135,12 +131,17 @@ sub new_root {
     confess "new_root called from child thread!"
         if $ROOT_TID != get_tid();
 
+    $params{+FD} //= $ENV{T2_STREAM_FD} // $ROOT_FD;
+    my $job_id = $params{+JOB_ID} //= $ENV{T2_STREAM_JOB_ID} // $ROOT_JOB_ID // 1;
+
     require Test2::API;
     my $io = $params{+IO} = [Test2::API::test2_stdout(), Test2::API::test2_stderr()];
-    $_->autoflush(1) for @$io;
 
-    $params{+FD}     //= $ENV{T2_STREAM_FD}     // $ROOT_FD;
-    $params{+JOB_ID} //= $ENV{T2_STREAM_JOB_ID} // $ROOT_JOB_ID // 1;
+    my $esync = "T2-HARNESS-$job_id-ESYNC: " . time . " 0\n";
+    for my $fh (@$io) {
+        $fh->autoflush(1);
+        print $fh $esync;
+    }
 
     # DO NOT REOPEN THEM!
     delete $ENV{T2_FORMATTER} if $ENV{T2_FORMATTER} && $ENV{T2_FORMATTER} eq 'Stream';
@@ -158,7 +159,6 @@ sub record {
     my ($facets, $num) = @_;
 
     my $stamp = time;
-    my $times = [times];
 
     my @sync = @{$self->{+IO}};
     my $leader = 0;
@@ -170,7 +170,6 @@ sub record {
     }
 
     my $tid = get_tid();
-    my $id  = $self->{+STREAM_ID}++;
 
     my $json;
     {
@@ -179,24 +178,21 @@ sub record {
 
         my $event_id = $facets->{about}->{uuid} ||= gen_uuid();
 
+        confess "'stream' facet already exists in event before Stream could tag it" if $facets->{stream};
+
+        $facets->{stream} = {
+            pid       => $$,
+            tid       => $tid,
+            stamp     => $stamp,
+            event_id  => $event_id,
+        };
+
+        $facets->{stream}->{assert_count} = $num unless $self->{+_NO_NUMBERS};
+
         if (JSON_IS_XS) {
             for my $encoder (ENCODER, ENCODER_PP) {
                 local $@;
-                my $ok = eval {
-                    $json = $encoder->encode(
-                        {
-                            stamp        => $stamp,
-                            times        => $times,
-                            stream_id    => $id,
-                            tid          => $tid,
-                            pid          => $$,
-                            event_id     => $event_id,
-                            facet_data   => $facets,
-                            assert_count => $self->{+_NO_NUMBERS} ? undef : $num,
-                        }
-                    );
-                    1;
-                };
+                my $ok  = eval { $json = $encoder->encode($facets); 1 };
                 my $err = $@;
                 last if $ok;
 
@@ -208,18 +204,7 @@ sub record {
             }
         }
         else {
-            $json = ENCODER->encode(
-                {
-                    stamp        => $stamp,
-                    times        => $times,
-                    stream_id    => $id,
-                    tid          => $tid,
-                    pid          => $$,
-                    event_id     => $event_id,
-                    facet_data   => $facets,
-                    assert_count => $self->{+_NO_NUMBERS} ? undef : $num,
-                }
-            );
+            $json = ENCODER->encode($facets);
         }
     }
 
@@ -230,7 +215,7 @@ sub record {
 
     print $fh $leader ? ("T2-HARNESS-$job_id-EVENT: " . $json . "\n") : ($json, "\n");
 
-    my $esync = "T2-HARNESS-$job_id-ESYNC: " . join(ipc_separator() => $$, $tid, $id) . "\n";
+    my $esync = "T2-HARNESS-$job_id-ESYNC: $stamp $event_id\n";
     print $_ $esync for @sync;
 }
 
